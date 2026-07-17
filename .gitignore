@@ -8,7 +8,7 @@ production-report/pyvenv.cfg
 __pycache__/
 *.pyc
 *.pyo
-*.egg-info/
+*.egg-info
 
 # IDE
 .idea/
