@@ -17,7 +17,11 @@ SENDER = "b-mes@chiachang.com"; SENDER_NAME = "MES系统"
 
 RECIPIENTS = [
     ("prima.yang@chiachang.com", "MES经理"), ("meng.wang@chiachang.com", ""),
-    ("ryan.lai@chiachang.com", "制造一部经理"), ("zhiyong.wang@chiachang.com", "生管课长"),
+    ("ryan.lai@chiachang.com", "制造一部经理"),
+    ("houlin.song@chiachang.com", "制一部课长"),
+    ("yongjun.chen@chiachang.com", "制一部课长"),
+    ("jian.zhang@chiachang.com", "制一部课长"),
+    ("zhiyong.wang@chiachang.com", "生管课长"),
     ("rongrong.guo@chiachang.com", "生管"), ("chuang.fan@chiachang.com", "生管"),
     ("mingxing.wang@chiachang.com", "生管"), ("linfan.zhang@chiachang.com", "制造二部经理"),
     ("b-mfg210@chiachang.com", "制二统计"), ("yaya.fan@chiachang.com", "制一统计"),
