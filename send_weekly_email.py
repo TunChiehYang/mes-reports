@@ -26,11 +26,6 @@ SENDER_NAME = "MES系统"
 RECIPIENTS = [
     ("prima.yang@chiachang.com", "MES经理"),
     ("meng.wang@chiachang.com", ""),
-    ("ryan.lai@chiachang.com", "制造一部经理"),
-    ("houlin.song@chiachang.com", "制一部课长"),
-    ("yongjun.chen@chiachang.com", "制一部课长"),
-    ("jian.zhang@chiachang.com", "制一部课长"),
-    ("l.c.cheng@chiachang.com", "总经理"),
 ]
 
 def find_latest_report():
