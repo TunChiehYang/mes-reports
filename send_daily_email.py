@@ -1,42 +1,61 @@
 #!/usr/bin/env python3
-"""生产日报邮件 — 从 CSV 直接提取数据"""
-import re, sys, smtplib, pandas as pd
+"""生产日报邮件 — 从 PG plan_daily_detail（Oracle GET_VALID_WOW 直连）提取前一天完整数据
+白班+夜班，SMTP 走内网 192.168.0.188:465
+用法: python3 send_daily_email.py [YYYY-MM-DD]   # 缺省=昨天（服务器时间-1）
+"""
+import re, sys, smtplib, urllib.request
+import pandas as pd
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-OUTPUT_DIR = Path("/mnt/d/outputHTML")
-DAILY_DIR = Path("/mnt/d/ShareExport/output/V_PLAN_ACTUAL_SUMMARY")
-REPORT_URL_BASE = "http://192.168.101.152:8080"
+REPORT_URL_BASE = "http://10.2.20.127:8080"
 
-SMTP_HOST = "mail.chiachang.com"; SMTP_PORT = 465
+SMTP_HOST = "192.168.0.188"; SMTP_PORT = 465
 SMTP_USER = "b-mes"; SMTP_PASS = "gmo@1001"
 SENDER = "b-mes@chiachang.com"; SENDER_NAME = "MES系统"
 
+# 测试阶段：仅发 prima.yang（KPI 定稿后放开全量名单）
 RECIPIENTS = [
-    ("prima.yang@chiachang.com", "MES经理"), ("meng.wang@chiachang.com", ""),
-    ("ryan.lai@chiachang.com", "制造一部经理"),
-    ("houlin.song@chiachang.com", "制一部课长"),
-    ("yongjun.chen@chiachang.com", "制一部课长"),
-    ("jian.zhang@chiachang.com", "制一部课长"),
-    ("zhiyong.wang@chiachang.com", "生管课长"),
-    ("rongrong.guo@chiachang.com", "生管"), ("chuang.fan@chiachang.com", "生管"),
-    ("mingxing.wang@chiachang.com", "生管"), ("linfan.zhang@chiachang.com", "制造二部经理"),
-    ("b-mfg210@chiachang.com", "制二统计"), ("yaya.fan@chiachang.com", "制一统计"),
-    ("l.c.cheng@chiachang.com", "总经理"),
+    ("prima.yang@chiachang.com", "MES经理"),
 ]
 
-today_str = datetime.now().strftime("%Y年%m月%d日")
+import psycopg2
+import psycopg2.extras
+PG = dict(host='10.2.20.127', port=5432, user='postgres',
+          password='Chia@1234', dbname='mes_plan')
 
-# Read latest daily CSV
-daily_files = sorted(DAILY_DIR.glob("V_PLAN_ACTUAL_SUMMARY_*.csv"), reverse=True)
-df = pd.read_csv(daily_files[0], encoding='gbk')
-df['PLANQTY'] = pd.to_numeric(df['PLANQTY'], errors='coerce').fillna(0).astype(int)
-df['AUTOQTY'] = pd.to_numeric(df['AUTOQTY'], errors='coerce').fillna(0).astype(int)
-df['NOTE'] = df['NOTE'].fillna('').str.strip()
-df_norm = df[df['NOTE'] == '正常'].copy()
+# 目标日期：缺省 = 昨天（服务器时区 Asia/Shanghai）
+target = sys.argv[1] if len(sys.argv) > 1 else (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+conn = psycopg2.connect(**PG)
+cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+# 前一天完整数据（白班+夜班），按 (line_id, wo_id, clas_type) 去重取最新 sync_time
+cur.execute("""
+    SELECT DISTINCT ON (line_id, wo_id, clas_type) *
+    FROM plan_daily_detail
+    WHERE tplan_start = %s
+    ORDER BY line_id, wo_id, clas_type, sync_time DESC
+""", (target,))
+rows = cur.fetchall()
+cur.close()
+conn.close()
+if not rows:
+    print(f"⚠ {target} 无数据（可能是周末/未排产），跳过邮件")
+    sys.exit(0)
+
+dt = datetime.strptime(target, '%Y-%m-%d')
+date_str = dt.strftime('%Y年%m月%d日')
+subject_date = dt.strftime('%m/%d')
+
+df = pd.DataFrame(rows).fillna('')
+df['wo_plan_qty'] = pd.to_numeric(df['wo_plan_qty'], errors='coerce').fillna(0).astype(int)
+df['actual_qty'] = pd.to_numeric(df['actual_qty'], errors='coerce').fillna(0).astype(int)
+df['PLANQTY'] = df['wo_plan_qty']
+df['AUTOQTY'] = df['actual_qty']
+df_norm = df[df['actual_qty'] > 0].copy()  # 有产出 = 有效生产
 
 # Overall
 total_plan = int(df_norm['PLANQTY'].sum())
@@ -44,36 +63,50 @@ total_actual = int(df_norm['AUTOQTY'].sum())
 total_ach = total_actual / total_plan * 100 if total_plan else 0
 
 # By dept+shift
-d1 = df_norm[df_norm['LINE_ID'].str.match(r'^(NA|NB)')]
-d2 = df_norm[df_norm['LINE_ID'].str.match(r'^NQ')]
+d1 = df_norm[df_norm['line_id'].str.match(r'^(NA|NB)')]
+d2 = df_norm[df_norm['line_id'].str.match(r'^NQ')]
 
+shift_plan = {}; shift_act = {}
 for label, data in [('d1', d1), ('d2', d2)]:
     for shift in ['白班', '夜班']:
-        sub = data[data['CLAS_TYPE'] == shift]
-        globals()[f'{label}_{shift}_plan'] = int(sub['PLANQTY'].sum())
-        globals()[f'{label}_{shift}_act'] = int(sub['AUTOQTY'].sum())
+        sub = data[data['clas_type'] == shift]
+        shift_plan[f'{label}_{shift}'] = int(sub['PLANQTY'].sum())
+        shift_act[f'{label}_{shift}'] = int(sub['AUTOQTY'].sum())
 
 # Line ranking
-line_ach = df_norm.groupby('LINE_ID').agg(
+line_ach = df_norm.groupby('line_id').agg(
     plan=('PLANQTY','sum'), actual=('AUTOQTY','sum'),
-    model=('ACTUAL_MODEL_LIST', lambda x: '/'.join(sorted(set(str(m) for m in x if str(m).strip()))[:40]))
+    model=('model_no', lambda x: '/'.join(sorted(set(str(m) for m in x if str(m).strip()))[:40]))
 ).reset_index()
 line_ach['ach'] = (line_ach['actual'] / line_ach['plan'].replace(0,1) * 100).clip(0,200)
 line_ach = line_ach[line_ach['plan'] > 0].sort_values('ach', ascending=False)
 
-d1_lines = line_ach[line_ach['LINE_ID'].str.match(r'^(NA|NB)')]
-d2_lines = line_ach[line_ach['LINE_ID'].str.match(r'^NQ')]
+d1_lines = line_ach[line_ach['line_id'].str.match(r'^(NA|NB)')]
+d2_lines = line_ach[line_ach['line_id'].str.match(r'^NQ')]
 
 def fmt_top(items, n=3):
     lines = []
     for _, r in items.head(n).iterrows():
-        lines.append(f"    {r['LINE_ID']} | {str(r['model'])[:20]} | 计划{int(r['plan']):,} 实际{int(r['actual']):,} 达成率{r['ach']:.1f}%")
+        lines.append(f"    {r['line_id']} | {str(r['model'])[:20]} | 计划{int(r['plan']):,} 实际{int(r['actual']):,} 达成率{r['ach']:.1f}%")
     return '\n'.join(lines)
 
-# Build email
-body = f"""各位主管，{'早上' if datetime.now().hour < 12 else '晚上'}好：
+# 报告链接：匹配 生产日报PG_{YYYYMMDD}_*.html
+def report_link(date8):
+    try:
+        idx = urllib.request.urlopen(f"{REPORT_URL_BASE}/index.html", timeout=10).read().decode('utf-8', 'ignore')
+        files = sorted(set(re.findall(rf'生产日报PG_{date8}_\d+\.html', idx)))
+        if files:
+            return f"{REPORT_URL_BASE}/{files[-1]}"
+    except Exception as e:
+        print(f"[warn] 取报告链接失败: {e}")
+    return f"{REPORT_URL_BASE}/"
 
-{today_str} 生产日报已生成。
+link = report_link(target.replace('-', ''))
+
+# Build email
+body = f"""各位主管，早上好：
+
+{date_str} 生产日报已生成（前一日白班+夜班完整数据）。
 
 ═══════════════════════════════
   📊 关键指标
@@ -81,18 +114,13 @@ body = f"""各位主管，{'早上' if datetime.now().hour < 12 else '晚上'}�
   全厂: 计划 {total_plan:,} / 实际 {total_actual:,} / 达成率 {total_ach:.1f}%
 
   🏭 制造一部（冲压）
-    夜班 计划 {d1_夜班_plan:,} 实际 {d1_夜班_act:,}
-    白班 计划 {d1_白班_plan:,} 实际 {d1_白班_act:,}
+    白班 计划 {shift_plan['d1_白班']:,} 实际 {shift_act['d1_白班']:,}
+    夜班 计划 {shift_plan['d1_夜班']:,} 实际 {shift_act['d1_夜班']:,}
 
   🏗️ 制造二部（清洗+组装）
-    夜班 计划 {d2_夜班_plan:,} 实际 {d2_夜班_act:,}
-    白班 计划 {d2_白班_plan:,} 实际 {d2_白班_act:,}
+    白班 计划 {shift_plan['d2_白班']:,} 实际 {shift_act['d2_白班']:,}
+    夜班 计划 {shift_plan['d2_夜班']:,} 实际 {shift_act['d2_夜班']:,}
 ═══════════════════════════════
-
-【📝 关注产线】
-  低达成率产线：
-{fmt_top(d1_lines.tail(3), 3)}
-{fmt_top(d2_lines.tail(3), 3)}
 
 【🏭 制造一部 达成率排名 TOP/BOTTOM】
   TOP 3:
@@ -106,10 +134,7 @@ body = f"""各位主管，{'早上' if datetime.now().hour < 12 else '晚上'}�
   BOTTOM 3:
 {fmt_top(d2_lines.tail(3), 3)}
 
-【🌗 同机种日夜班差异 TOP 5】
-  使用当前日报 HTML 查看：{REPORT_URL_BASE}/
-
-📎 完整日报：{REPORT_URL_BASE}/{sorted(OUTPUT_DIR.glob('生产日报_*.html'), reverse=True)[0].name if list(OUTPUT_DIR.glob('生产日报_*.html')) else ''}
+📎 完整日报：{link}
 
 此致 · MES系统自动发送
 """
@@ -118,11 +143,11 @@ body = f"""各位主管，{'早上' if datetime.now().hour < 12 else '晚上'}�
 msg = MIMEMultipart()
 msg['From'] = f"{SENDER_NAME} <{SENDER}>"
 msg['To'] = ', '.join(a for a,_ in RECIPIENTS)
-msg['Subject'] = Header(f"[测试]生产日报 - {datetime.now().strftime('%m/%d')}", 'utf-8')
+msg['Subject'] = Header(f"生产日报 - {subject_date}", 'utf-8')
 msg.attach(MIMEText(body, 'plain', 'utf-8'))
 
 server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
 server.login(SMTP_USER, SMTP_PASS)
 server.sendmail(SENDER, [a for a,_ in RECIPIENTS], msg.as_string())
 server.quit()
-print("✅ 已发送")
+print(f"✅ 邮件已发送: {', '.join(a for a,_ in RECIPIENTS)} | 日期 {target}")

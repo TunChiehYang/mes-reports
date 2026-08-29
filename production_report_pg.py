@@ -53,10 +53,10 @@ def calc_shift_seq(rows, latest):
     """计算每个工单当前是第几个班生产（开始有产出=第1班）+ 进度偏差
     数据源: plan_actual_hourly（Oracle GET_VALID_WOW 每小时同步积累）
     班次键 = (tplan_start, clas_type)
-    rows: 当前同步的所有行（用于确定当前工单集合）
-    latest: 当前 sync_time（datetime）
+    rows: 目标日期的所有行（白班+夜班完整）
+    latest: 目标日期（datetime）
     返回 { (line_id, wo_id): {'nth':n, 'plan_sum':p, 'done':d, 'diff':x, 'diff_pct':y} }
-    评估基准：当班之前的一班（当前班次数据不完整，先不算）
+    评估基准：目标日期最后班次（前一天完整数据，不减一）
     """
     conn = None
     try:
@@ -64,7 +64,7 @@ def calc_shift_seq(rows, latest):
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         # 当前工单集合
         wanted = {(r['line_id'], r['wo_id']) for r in rows}
-        # 查这些工单的全部历史（当前同步往前30天）
+        # 查这些工单的全部历史（目标日期往前30天）
         from datetime import timedelta as _td
         d0 = latest - _td(days=30)
         cur.execute("""
@@ -101,15 +101,19 @@ def calc_shift_seq(rows, latest):
             d = d.date()
         return (str(d), 0 if r['clas_type'] == '白班' else 1)
 
-    # 当前班次 = 最新同步数据里的 (tplan_start, clas_type)
-    cur_shift = None
+    # 当前班次 = 目标日期最后班次（夜班优先，否则白班）
+    target_day = None
     for r in rows:
-        if r.get('tplan_start') and r.get('clas_type'):
+        if r.get('tplan_start'):
             d = r['tplan_start']
             if hasattr(d, 'date'):
                 d = d.date()
-            cur_shift = (str(d), 0 if r['clas_type'] == '白班' else 1)
+            target_day = str(d)
             break
+    cur_shift = None
+    if target_day:
+        has_night = any(r.get('clas_type') == '夜班' for r in rows)
+        cur_shift = (target_day, 1 if has_night else 0)
 
     # 按 (line, wo) 分组，班次聚合（同一班次多次快照取最新）
     from collections import OrderedDict
@@ -140,8 +144,8 @@ def calc_shift_seq(rows, latest):
                 break
         if cur_idx is None:
             cur_idx = len(sorted_shifts) - 1
-        # 评估基准：当班之前的一班（当前班次数据不完整，先不算）
-        eval_idx = cur_idx - 1
+        # 评估基准：目标日期最后班次（前一天数据完整，不减一）
+        eval_idx = cur_idx
         if eval_idx < first_idx or eval_idx < 0:
             continue
         nth = eval_idx - first_idx + 1
@@ -163,44 +167,34 @@ def main():
     conn = psycopg2.connect(**PG)
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # 最新同步数据（Oracle GET_VALID_WOW 直连 → plan_daily_detail 生产日报专用表）
-    # 支持参数指定 sync_time 便于测试
+    # 数据源: plan_daily_detail（Oracle GET_VALID_WOW 完整17列）
+    # 日报 = 前一天完整数据（白班+夜班），按 (line_id, wo_id, clas_type) 去重取最新 sync_time
+    # 支持参数指定 tplan_start 日期便于测试: python3 production_report_pg.py [YYYY-MM-DD]
     import sys as _sys
+    from datetime import timedelta as _td
     if len(_sys.argv) > 1:
-        latest = _sys.argv[1]
-        cur.execute("SELECT * FROM plan_daily_detail WHERE sync_time = %s", (latest,))
-        rows = cur.fetchall()
+        target_date = _sys.argv[1]
     else:
-        # 自动选取最近一次有产出的同步
-        cur.execute("""
-            SELECT sync_time FROM plan_daily_detail
-            GROUP BY sync_time
-            HAVING SUM(actual_qty) > 1000
-            ORDER BY sync_time DESC LIMIT 1
-        """)
-        row = cur.fetchone()
-        if row is None:
-            cur.execute("SELECT MAX(sync_time) as st FROM plan_daily_detail")
-            row = cur.fetchone()
-        latest = row['sync_time']
-        cur.execute("SELECT * FROM plan_daily_detail WHERE sync_time = %s", (latest,))
-        rows = cur.fetchall()
-        print(f"  最近有产出同步: {latest}")
+        # 缺省 = 昨天（日报上午8:30生成，取前一天完整数据）
+        target_date = (datetime.now() - _td(days=1)).strftime('%Y-%m-%d')
+    cur.execute("""
+        SELECT DISTINCT ON (line_id, wo_id, clas_type) *
+        FROM plan_daily_detail
+        WHERE tplan_start = %s
+        ORDER BY line_id, wo_id, clas_type, sync_time DESC
+    """, (target_date,))
+    rows = cur.fetchall()
     cur.close()
     conn.close()
+    if not rows:
+        print(f"⚠ {target_date} 无数据（可能是周末/未排产），跳过日报生成")
+        return
 
     df = [dict(r) for r in rows]
-    print(f"数据源: plan_daily_detail @ {latest} | {len(df)} 行")
+    print(f"数据源: plan_daily_detail @ {target_date} | {len(df)} 行（白班+夜班完整）")
 
-    # ── 按当前班次过滤（白班8-20 / 夜班20-8，与当班分析一致）──
-    cur_hour = latest.hour if hasattr(latest, 'hour') else 12
-    cur_shift = "白班" if 8 <= cur_hour < 20 else "夜班"
-    avail = {r['clas_type'] for r in df if r['clas_type']}
-    if avail and cur_shift not in avail:
-        cur_shift = sorted(avail)[0]
-    df = [r for r in df if r['clas_type'] == cur_shift]
-    rows = [r for r in rows if r['clas_type'] == cur_shift]
-    print(f"  当前班次: {cur_shift} | 过滤后 {len(df)} 行")
+    # 目标日期（用于班序历史查询边界 = 前一天最后一刻）
+    latest = datetime.strptime(target_date, '%Y-%m-%d') + _td(days=1) - _td(seconds=1)
 
     # ── 班序 + 进度偏差（基于历史快照）──
     shift_seq = calc_shift_seq(rows, latest)
@@ -392,13 +386,10 @@ def main():
     d1 = dept_agg.get('制造一部', {'actual': 0})
     d2 = dept_agg.get('制造二部', {'actual': 0})
     idle = total_lines - active_lines
-    # 生产日期 = 数据里的 tplan_start（Oracle 直连当天实时）
-    if df and df[0].get('tplan_start'):
-        tplan = df[0]['tplan_start']
-        date_label = tplan.strftime('%Y%m%d') if hasattr(tplan, 'strftime') else str(tplan)[:10]
-    else:
-        date_label = latest.strftime('%Y%m%d') if hasattr(latest, 'strftime') else str(latest)[:10]
-    summary = f'''<p>📅 <b>{date_label}</b> 生产数据（Oracle 直连）· {total_lines} 条产线，其中 <b>{active_lines}</b> 条有产出，{idle} 条空闲/待排。</p>
+    # 生产日期 = 目标日期（前一天白班+夜班完整数据）
+    date_label = target_date.replace('-', '')
+    date_show = target_date
+    summary = f'''<p>📅 <b>{date_show}</b> 生产日报（前一日白班+夜班完整数据，Oracle 直连）· {total_lines} 条产线，其中 <b>{active_lines}</b> 条有产出，{idle} 条空闲/待排。</p>
 <p>📊 总计划 <b>{total_plan:,}</b>，总实际产出 <b>{total_actual:,}</b>，综合达成率 <b>{ach_all:.1f}%</b>。</p>
 <p>🏭 制造一部（冲压）产出 {d1.get("actual", 0):,}，制造二部（清洗）产出 {d2.get("actual", 0):,}。</p>
 <p>📦 已完成切线 <b>{status_cnt.get("已完成切线", 0)}</b> 条产线，有计划但无切线 <b>{status_cnt.get("有计划但无切线", 0)}</b> 条，无计划 <b>{status_cnt.get("无计划", 0)}</b> 条。</p>'''
@@ -475,7 +466,7 @@ tr:hover td{{background:#f0f4f8}}
 <body>
 <div class="header">
 <h1>🏭 生产日报（PG 版）</h1>
-<div class="meta">数据源: Oracle GET_VALID_WOW → plan_daily_detail @ 10.2.20.127 · 同步 {latest} · 生成 {now}</div>
+<div class="meta">数据源: Oracle GET_VALID_WOW → plan_daily_detail @ 10.2.20.127 · 生产日期 {date_show}（前一日白班+夜班）· 生成 {now}</div>
 </div>
 <div class="container">
 
@@ -517,7 +508,7 @@ tr:hover td{{background:#f0f4f8}}
 </body></html>'''
 
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out = OUT / f"生产日报PG_{ts}.html"
+    out = OUT / f"生产日报PG_{date_label}_{ts.split('_')[1]}.html"
     out.write_text(html, encoding='utf-8')
     print(f"✅ {out} ({out.stat().st_size / 1024:.0f} KB)")
 
