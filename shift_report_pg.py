@@ -684,9 +684,12 @@ def generate_html(records, dept_data, top5, zero_lines, total_plan, total_done, 
     chart_wash = chart_direct_wash(records)
     chart_labor = chart_labor_efficiency(records)
 
-    # 稼动率 = 实际产出 / 标准产能（capacit）
+    # 稼动率/产出达成率 = 实际产出 / 标准产能（capacit）
+    # 口径：分母只算当班有产出的工单产能（同产线多工单时仅实际生产的工单消耗产能，
+    #       排队/待切工单不计入，避免分母虚高）
     sum_actual = sum(r['shift_done'] for r in records)
-    sum_capacit = sum(r['capacit'] for r in records)
+    _prod = [r for r in records if r['shift_done'] > 0]
+    sum_capacit = sum(r['capacit'] for r in _prod)
     utilization = sum_actual / sum_capacit * 100 if sum_capacit else 0
     # 人均产出 = 实际产出 / 标准人力（按产线去重，同产线多工单共享人力只算一次）
     _lstats = labor_line_stats(records)
